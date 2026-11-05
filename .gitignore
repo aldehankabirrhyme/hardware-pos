@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+uploads/
+.pnp
+.pnp.js
+
+# Environment & Sensitive Files
+.env
+.env.local
+.env.development
+.env.production
+.env.development.local
+.env.test.local
+.env.production.local
+*.pem
+
+# Production Builds
+dist/
+build/
+out/
+.next/
+
+# Logs & Debugging
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Database & Prisma
+prisma/dev.db
+prisma/dev.db-journal
+*.sqlite
+*.sqlite-journal
+
+# IDEs & OS Files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+.DS_Store
+Thumbs.db
