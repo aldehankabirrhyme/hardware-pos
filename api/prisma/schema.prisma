@@ -1,0 +1,187 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  SALESMAN
+}
+
+enum PaymentMethod {
+  CASH
+  BKASH
+  NAGAD
+  BANK_TRANSFER
+  CREDIT_DUE
+}
+
+enum OrderStatus {
+  COMPLETED
+  PENDING_VERIFICATION
+  CANCELLED
+}
+
+model User {
+  id            String         @id @default(uuid())
+  name          String
+  phone         String         @unique
+  email         String?        @unique
+  passwordHash  String
+  role          Role           @default(SALESMAN)
+  permissions   Json           // Dynamic permissions e.g. { "canViewProfit": false, "canEditStock": false }
+  isActive      Boolean        @default(true)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  
+  sales         Sale[]         @relation("CreatedSales")
+  expenses      Expense[]
+  auditLogs     AuditLog[]
+}
+
+model Customer {
+  id            String         @id @default(uuid())
+  name          String
+  phone         String         @unique
+  email         String?
+  address       String?
+  totalDues     Decimal        @default(0.00) @db.Decimal(10, 2) // Dues balance (Baki)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  sales         Sale[]
+  duePayments   DuePayment[]
+  otpCodes      OTPVerification[]
+}
+
+model Category {
+  id            String         @id @default(uuid())
+  name          String         @unique
+  products      Product[]
+}
+
+model Brand {
+  id            String         @id @default(uuid())
+  name          String         @unique
+  products      Product[]
+}
+
+model Product {
+  id            String         @id @default(uuid())
+  sku           String         @unique
+  name          String
+  categoryId    String?
+  brandId       String?
+  size          String?        // e.g., 6 inc, 5 meter
+  color         String?
+  unit          String         @default("pieces") // pieces, meter, kg
+  buyingPrice   Decimal        @db.Decimal(10, 2)
+  sellingPrice  Decimal        @db.Decimal(10, 2)
+  stockQuantity Int            @default(0)
+  reorderLevel  Int            @default(5)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  imageUrl      String?
+  category      Category?      @relation(fields: [categoryId], references: [id])
+  brand         Brand?         @relation(fields: [brandId], references: [id])
+  saleItems     SaleItem[]
+}
+
+model Sale {
+  id            String         @id @default(uuid())
+  invoiceNo     String         @unique
+  customerId    String
+  userId        String         // Cashier / User ID
+  totalAmount   Decimal        @db.Decimal(10, 2)
+  paidAmount    Decimal        @db.Decimal(10, 2)
+  dueAmount     Decimal        @db.Decimal(10, 2)
+  paymentMethod PaymentMethod  @default(CASH)
+  status        OrderStatus    @default(COMPLETED)
+  createdAt     DateTime       @default(now())
+
+  customer      Customer       @relation(fields: [customerId], references: [id])
+  user          User           @relation("CreatedSales", fields: [userId], references: [id])
+  items         SaleItem[]
+  duePayments   DuePayment[]
+}
+
+model SaleItem {
+  id            String         @id @default(uuid())
+  saleId        String
+  productId     String
+  quantity      Int
+  unitPrice     Decimal        @db.Decimal(10, 2)
+  subTotal      Decimal        @db.Decimal(10, 2)
+
+  sale          Sale           @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product       Product        @relation(fields: [productId], references: [id])
+}
+
+model DuePayment {
+  id            String         @id @default(uuid())
+  saleId        String?
+  customerId    String
+  amountPaid    Decimal        @db.Decimal(10, 2)
+  paymentMethod PaymentMethod  @default(CASH)
+  verified      Boolean        @default(true)
+  notes         String?
+  createdAt     DateTime       @default(now())
+
+  sale          Sale?          @relation(fields: [saleId], references: [id])
+  customer      Customer       @relation(fields: [customerId], references: [id])
+}
+
+model Expense {
+  id            String   @id @default(uuid())
+  title         String
+  category      String   // Rent, Electricity, Salaries, Transport, etc.
+  amount        Decimal  @db.Decimal(10, 2)
+  recordedById  String
+  date          DateTime @default(now()) // Start date of expense
+  notes         String?
+
+  // Amortization fields for prorating costs across days
+  spanType      String   @default("DAILY") // DAILY, WEEKLY, MONTHLY, YEARLY, CUSTOM
+  durationValue Int      @default(1)       // e.g. 3 weeks, 6 months, 1 year
+  endDate       DateTime?                  // Calculated end date for span distribution
+
+  recordedBy    User     @relation(fields: [recordedById], references: [id])
+}
+
+model OTPVerification {
+  id            String         @id @default(uuid())
+  customerId    String
+  phone         String
+  code          String
+  expiresAt     DateTime
+  isVerified    Boolean        @default(false)
+  createdAt     DateTime       @default(now())
+
+  customer      Customer       @relation(fields: [customerId], references: [id])
+}
+
+model SystemSettings {
+  id                   String   @id @default("global_config")
+  shopName             String   @default("Hardware Shop")
+  requireDueOtpVerify  Boolean  @default(true) // Admin toggle for Due OTP Verification
+  smsGatewayApiKey     String?
+  smsSenderId          String?
+  bkashMerchantId      String?
+  bkashAppKey          String?
+  updatedAt            DateTime @updatedAt
+}
+
+model AuditLog {
+  id            String         @id @default(uuid())
+  userId        String
+  action        String
+  details       String
+  createdAt     DateTime       @default(now())
+
+  user          User           @relation(fields: [userId], references: [id])
+}
