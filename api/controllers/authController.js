@@ -11,6 +11,7 @@ exports.login = async (req, res) => {
 
     // Find user in PostgreSQL database by email
     const user = await prisma.user.findUnique({ where: { email } });
+    console.log('User found:', user ? user.email : 'No user found');
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
@@ -32,7 +33,9 @@ exports.login = async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Login error:', error);
+    if(process.env.environment === 'development') {
+      console.error('Login error:', error);
+    }
     res.status(500).json({ error: 'Internal server error during login' });
   }
 };

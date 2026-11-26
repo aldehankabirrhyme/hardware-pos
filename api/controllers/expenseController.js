@@ -265,9 +265,58 @@ exports.getMonthlyAnalytics = async (req, res) => {
 // };
 
 // Add Expense with Amortization Calculation
+// exports.addExpense = async (req, res) => {
+//   try {
+//     const { title, category, amount, notes, userId, spanType = 'DAILY', durationValue = 1, date } = req.body;
+//     const parsedAmount = parseFloat(amount);
+
+//     if (!title || isNaN(parsedAmount) || parsedAmount <= 0) {
+//       return res.status(400).json({ error: 'Valid title and amount are required' });
+//     }
+
+//     let targetUserId = userId;
+//     if (!targetUserId) {
+//       const defaultUser = await prisma.user.findFirst();
+//       if (defaultUser) targetUserId = defaultUser.id;
+//     }
+
+//     const startDateObj = date ? new Date(date) : new Date();
+//     let endDateObj = new Date(startDateObj);
+//     const durVal = parseInt(durationValue, 10) || 1;
+
+//     // Calculate span end date
+//     if (spanType === 'DAILY') endDateObj.setDate(startDateObj.getDate() + durVal - 1);
+//     else if (spanType === 'WEEKLY') endDateObj.setDate(startDateObj.getDate() + durVal * 7 - 1);
+//     else if (spanType === 'MONTHLY') endDateObj.setMonth(startDateObj.getMonth() + durVal);
+//     else if (spanType === 'YEARLY') endDateObj.setFullYear(startDateObj.getFullYear() + durVal);
+//     else endDateObj = null;
+
+//     const expense = await prisma.expense.create({
+//       data: {
+//         title,
+//         category: category || 'General',
+//         amount: parsedAmount,
+//         notes: notes || '',
+//         spanType,
+//         durationValue: durVal,
+//         date: startDateObj,
+//         endDate: endDateObj,
+//         recordedBy: { connect: { id: targetUserId } }
+//       }
+//     });
+
+//     res.json({ success: true, message: 'Expense recorded successfully with amortization', expense });
+//   } catch (error) {
+//     console.error('Error adding expense:', error);
+//     res.status(500).json({ error: 'Failed to record expense' });
+//   }
+// };
+
+// 1. Add Expense with Channel Support & Amortization
+// 1. Add Expense with LIFETIME & Channel Support
 exports.addExpense = async (req, res) => {
   try {
-    const { title, category, amount, notes, userId, spanType = 'DAILY', durationValue = 1, date } = req.body;
+    const { title, category, amount, notes, userId, spanType = 'DAILY', durationValue = 1, date, channel = 'BOTH' } = req.body;
     const parsedAmount = parseFloat(amount);
 
     if (!title || isNaN(parsedAmount) || parsedAmount <= 0) {
@@ -284,18 +333,18 @@ exports.addExpense = async (req, res) => {
     let endDateObj = new Date(startDateObj);
     const durVal = parseInt(durationValue, 10) || 1;
 
-    // Calculate span end date
     if (spanType === 'DAILY') endDateObj.setDate(startDateObj.getDate() + durVal - 1);
     else if (spanType === 'WEEKLY') endDateObj.setDate(startDateObj.getDate() + durVal * 7 - 1);
     else if (spanType === 'MONTHLY') endDateObj.setMonth(startDateObj.getMonth() + durVal);
     else if (spanType === 'YEARLY') endDateObj.setFullYear(startDateObj.getFullYear() + durVal);
-    else endDateObj = null;
+    else if (spanType === 'LIFETIME') endDateObj = null; // Lifetime has no end date span
 
     const expense = await prisma.expense.create({
       data: {
         title,
-        category: category || 'General',
+        category: category || 'Other',
         amount: parsedAmount,
+        channel,
         notes: notes || '',
         spanType,
         durationValue: durVal,
@@ -305,12 +354,497 @@ exports.addExpense = async (req, res) => {
       }
     });
 
-    res.json({ success: true, message: 'Expense recorded successfully with amortization', expense });
+    res.json({ success: true, message: 'Expense recorded successfully', expense });
   } catch (error) {
     console.error('Error adding expense:', error);
     res.status(500).json({ error: 'Failed to record expense' });
   }
 };
+
+exports.getFinancialAnalytics = async (req, res) => {
+  try {
+    const { filter = 'this_month', startDate, endDate, channel = 'ALL' } = req.query; // channel: 'ALL', 'POS', 'ECOMMERCE'
+    const { start, end, groupBy } = getDateRangeFilter(filter, startDate, endDate);
+
+    // Fetch POS sales, E-Commerce sales, and Amortized/Lifetime Expenses in parallel
+    const [posSales, ecommerceOrders, expenses] = await Promise.all([
+      // 1. In-Store POS Sales
+      prisma.sale.findMany({
+        where: { 
+          isOnlineOrder: false,
+          status: { notIn: ['CANCELLED', 'REJECTED', 'DELIVERY_FAILED'] },
+          createdAt: { gte: start, lte: end } 
+        },
+        include: { items: { include: { product: true } } }
+      }),
+      // 2. Online E-Commerce Orders
+      prisma.sale.findMany({
+        where: { 
+          isOnlineOrder: true,
+          status: { notIn: ['CANCELLED', 'REJECTED', 'DELIVERY_FAILED'] },
+          createdAt: { gte: start, lte: end } 
+        },
+        include: { items: { include: { product: true } } }
+      }),
+      // 3. Operating Expenses (Including Lifetime span support)
+      prisma.expense.findMany({
+        where: {
+          OR: [
+            { date: { lte: end }, endDate: { gte: start } },
+            { date: { gte: start, lte: end } },
+            { spanType: 'LIFETIME', date: { gte: start, lte: end } }
+          ]
+        }
+      })
+    ]);
+
+    // Build timeline buckets dynamically (Day-wise or Month-wise)
+    const timelineMap = {};
+    let curr = new Date(start);
+
+    if (groupBy === 'month') {
+      curr.setDate(1);
+      curr.setHours(0, 0, 0, 0);
+      while (curr <= end) {
+        const key = `${curr.getFullYear()}-${String(curr.getMonth() + 1).padStart(2, '0')}`;
+        timelineMap[key] = { 
+          date: key, 
+          label: curr.toLocaleString('default', { month: 'short', year: 'numeric' }), 
+          revenue: 0, 
+          posRevenue: 0,
+          ecommerceRevenue: 0,
+          cogs: 0, 
+          expenses: 0, 
+          netProfit: 0 
+        };
+        curr.setMonth(curr.getMonth() + 1);
+      }
+    } else {
+      while (curr <= end) {
+        const key = curr.toISOString().split('T')[0];
+        timelineMap[key] = { 
+          date: key, 
+          label: key, 
+          revenue: 0, 
+          posRevenue: 0,
+          ecommerceRevenue: 0,
+          cogs: 0, 
+          expenses: 0, 
+          netProfit: 0 
+        };
+        curr.setDate(curr.getDate() + 1);
+      }
+    }
+
+    let totalRevenue = 0;
+    let totalPosRevenue = 0;
+    let totalEcommerceRevenue = 0;
+    let totalCOGS = 0;
+
+    // Filter sales based on active channel view toggle
+    let activeSales = [];
+    if (channel === 'POS') activeSales = posSales;
+    else if (channel === 'ECOMMERCE') activeSales = ecommerceOrders;
+    else activeSales = [...posSales, ...ecommerceOrders];
+
+    // Aggregate Sales Revenue & COGS (Separating POS vs E-Commerce)
+    activeSales.forEach(sale => {
+      const saleDate = new Date(sale.createdAt);
+      const dateKey = groupBy === 'month' 
+        ? `${saleDate.getFullYear()}-${String(saleDate.getMonth() + 1).padStart(2, '0')}`
+        : saleDate.toISOString().split('T')[0];
+
+      const rev = parseFloat(sale.totalAmount || 0);
+      totalRevenue += rev;
+
+      if (sale.isOnlineOrder) {
+        totalEcommerceRevenue += rev;
+      } else {
+        totalPosRevenue += rev;
+      }
+
+      let saleCogs = 0;
+      sale.items.forEach(item => {
+        const buyingPrice = parseFloat(item.product?.buyingPrice || 0);
+        const lengthMult = item.customLength ? parseFloat(item.customLength) : 1;
+        saleCogs += buyingPrice * item.quantity * lengthMult;
+      });
+      totalCOGS += saleCogs;
+
+      if (timelineMap[dateKey]) {
+        timelineMap[dateKey].revenue += rev;
+        if (sale.isOnlineOrder) {
+          timelineMap[dateKey].ecommerceRevenue += rev;
+        } else {
+          timelineMap[dateKey].posRevenue += rev;
+        }
+        timelineMap[dateKey].cogs += saleCogs;
+      }
+    });
+
+    let totalExpenses = 0;
+
+    // Prorate amortized & lifetime expenses across buckets with channel attribution
+    expenses.forEach(exp => {
+      // Filter expenses by channel selection
+      if (channel !== 'ALL' && exp.channel !== channel && exp.channel !== 'BOTH') return;
+
+      let expenseAmount = parseFloat(exp.amount || 0);
+      if (exp.channel === 'BOTH' && channel !== 'ALL') {
+        expenseAmount = expenseAmount / 2; // Split 50/50 for shared expenses
+      }
+
+      if (exp.spanType === 'LIFETIME') {
+        // Lifetime expenses hit entirely on their creation date
+        const expDate = new Date(exp.date);
+        const dateKey = groupBy === 'month'
+          ? `${expDate.getFullYear()}-${String(expDate.getMonth() + 1).padStart(2, '0')}`
+          : expDate.toISOString().split('T')[0];
+
+        if (timelineMap[dateKey]) {
+          timelineMap[dateKey].expenses += expenseAmount;
+          totalExpenses += expenseAmount;
+        }
+      } else {
+        // Standard amortization prorating
+        const expStart = new Date(exp.date);
+        const expEnd = exp.endDate ? new Date(exp.endDate) : new Date(expStart);
+        const totalSpanDays = Math.max(1, Math.ceil((expEnd - expStart) / (1000 * 60 * 60 * 24)) + 1);
+        const dailyCost = expenseAmount / totalSpanDays;
+
+        let d = new Date(Math.max(expStart, start));
+        const rangeEndLimit = new Date(Math.min(expEnd, end));
+
+        while (d <= rangeEndLimit) {
+          const key = groupBy === 'month'
+            ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+            : d.toISOString().split('T')[0];
+
+          if (timelineMap[key]) {
+            timelineMap[key].expenses += dailyCost;
+            totalExpenses += dailyCost;
+          }
+          d.setDate(d.getDate() + 1);
+        }
+      }
+    });
+
+    const chartData = Object.values(timelineMap).map(item => {
+      const gross = item.revenue - item.cogs;
+      item.netProfit = gross - item.expenses;
+      return item;
+    });
+
+    const grossProfit = totalRevenue - totalCOGS;
+    const netProfit = grossProfit - totalExpenses;
+
+    res.json({
+      success: true,
+      summary: {
+        totalRevenue,
+        totalPosRevenue,
+        totalEcommerceRevenue,
+        totalCOGS,
+        grossProfit,
+        totalExpenses,
+        netProfit
+      },
+      chartData
+    });
+  } catch (error) {
+    console.error('Error fetching analytics:', error);
+    res.status(500).json({ error: 'Failed to generate analytics' });
+  }
+};
+
+// 2. Financial Analytics with Channel Filtering & Lifetime Expense Handling
+// exports.getFinancialAnalytics = async (req, res) => {
+//   try {
+//     const { filter = 'this_month', startDate, endDate, channel = 'ALL' } = req.query; // channel: 'ALL', 'POS', 'ECOMMERCE'
+//     const { start, end, groupBy } = getDateRangeFilter(filter, startDate, endDate);
+
+//     const [posSales, ecommerceOrders, expenses] = await Promise.all([
+//       prisma.sale.findMany({
+//         where: { 
+//           isOnlineOrder: false,
+//           status: { notIn: ['CANCELLED', 'REJECTED', 'DELIVERY_FAILED'] },
+//           createdAt: { gte: start, lte: end } 
+//         },
+//         include: { items: { include: { product: true } } }
+//       }),
+//       prisma.sale.findMany({
+//         where: { 
+//           isOnlineOrder: true,
+//           status: { notIn: ['CANCELLED', 'REJECTED', 'DELIVERY_FAILED'] },
+//           createdAt: { gte: start, lte: end } 
+//         },
+//         include: { items: { include: { product: true } } }
+//       }),
+//       prisma.expense.findMany({
+//         where: {
+//           OR: [
+//             { date: { lte: end }, endDate: { gte: start } },
+//             { date: { gte: start, lte: end } },
+//             { spanType: 'LIFETIME', date: { gte: start, lte: end } }
+//           ]
+//         }
+//       })
+//     ]);
+
+//     const timelineMap = {};
+//     let curr = new Date(start);
+
+//     if (groupBy === 'month') {
+//       curr.setDate(1);
+//       curr.setHours(0, 0, 0, 0);
+//       while (curr <= end) {
+//         const key = `${curr.getFullYear()}-${String(curr.getMonth() + 1).padStart(2, '0')}`;
+//         timelineMap[key] = { date: key, label: curr.toLocaleString('default', { month: 'short', year: 'numeric' }), revenue: 0, cogs: 0, expenses: 0, netProfit: 0 };
+//         curr.setMonth(curr.getMonth() + 1);
+//       }
+//     } else {
+//       while (curr <= end) {
+//         const key = curr.toISOString().split('T')[0];
+//         timelineMap[key] = { date: key, label: key, revenue: 0, cogs: 0, expenses: 0, netProfit: 0 };
+//         curr.setDate(curr.getDate() + 1);
+//       }
+//     }
+
+//     let totalRevenue = 0;
+//     let totalCOGS = 0;
+
+//     let activeSales = [];
+//     if (channel === 'POS') activeSales = posSales;
+//     else if (channel === 'ECOMMERCE') activeSales = ecommerceOrders;
+//     else activeSales = [...posSales, ...ecommerceOrders];
+
+//     activeSales.forEach(sale => {
+//       const saleDate = new Date(sale.createdAt);
+//       const dateKey = groupBy === 'month' 
+//         ? `${saleDate.getFullYear()}-${String(saleDate.getMonth() + 1).padStart(2, '0')}`
+//         : saleDate.toISOString().split('T')[0];
+
+//       const rev = parseFloat(sale.totalAmount || 0);
+//       totalRevenue += rev;
+
+//       let saleCogs = 0;
+//       sale.items.forEach(item => {
+//         const buyingPrice = parseFloat(item.product?.buyingPrice || 0);
+//         const lengthMult = item.customLength ? parseFloat(item.customLength) : 1;
+//         saleCogs += buyingPrice * item.quantity * lengthMult;
+//       });
+//       totalCOGS += saleCogs;
+
+//       if (timelineMap[dateKey]) {
+//         timelineMap[dateKey].revenue += rev;
+//         timelineMap[dateKey].cogs += saleCogs;
+//       }
+//     });
+
+//     let totalExpenses = 0;
+
+//     expenses.forEach(exp => {
+//       if (channel !== 'ALL' && exp.channel !== channel && exp.channel !== 'BOTH') return;
+
+//       let expenseAmount = parseFloat(exp.amount);
+//       if (exp.channel === 'BOTH' && channel !== 'ALL') {
+//         expenseAmount = expenseAmount / 2; // Split 50/50 for shared expenses
+//       }
+
+//       if (exp.spanType === 'LIFETIME') {
+//         // Lifetime expenses hit entirely on their creation date
+//         const expDate = new Date(exp.date);
+//         const dateKey = groupBy === 'month'
+//           ? `${expDate.getFullYear()}-${String(expDate.getMonth() + 1).padStart(2, '0')}`
+//           : expDate.toISOString().split('T')[0];
+
+//         if (timelineMap[dateKey]) {
+//           timelineMap[dateKey].expenses += expenseAmount;
+//           totalExpenses += expenseAmount;
+//         }
+//       } else {
+//         // Standard amortization prorating
+//         const expStart = new Date(exp.date);
+//         const expEnd = exp.endDate ? new Date(exp.endDate) : new Date(expStart);
+//         const totalSpanDays = Math.max(1, Math.ceil((expEnd - expStart) / (1000 * 60 * 60 * 24)) + 1);
+//         const dailyCost = expenseAmount / totalSpanDays;
+
+//         let d = new Date(Math.max(expStart, start));
+//         const rangeEndLimit = new Date(Math.min(expEnd, end));
+
+//         while (d <= rangeEndLimit) {
+//           const key = groupBy === 'month'
+//             ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+//             : d.toISOString().split('T')[0];
+
+//           if (timelineMap[key]) {
+//             timelineMap[key].expenses += dailyCost;
+//             totalExpenses += dailyCost;
+//           }
+//           d.setDate(d.getDate() + 1);
+//         }
+//       }
+//     });
+
+//     const chartData = Object.values(timelineMap).map(item => {
+//       const gross = item.revenue - item.cogs;
+//       item.netProfit = gross - item.expenses;
+//       return item;
+//     });
+
+//     const grossProfit = totalRevenue - totalCOGS;
+//     const netProfit = grossProfit - totalExpenses;
+
+//     res.json({
+//       success: true,
+//       summary: { totalRevenue, totalCOGS, grossProfit, totalExpenses, netProfit },
+//       chartData
+//     });
+//   } catch (error) {
+//     console.error('Error fetching analytics:', error);
+//     res.status(500).json({ error: 'Failed to generate analytics' });
+//   }
+// };
+
+// 2. Advanced Financial Analytics with Channel-Aware Expense Allocation
+// exports.getFinancialAnalytics = async (req, res) => {
+//   try {
+//     const { filter = 'this_month', startDate, endDate, channel = 'ALL' } = req.query; // channel: 'ALL', 'POS', 'ECOMMERCE'
+//     const { start, end, groupBy } = getDateRangeFilter(filter, startDate, endDate);
+
+//     const [posSales, ecommerceOrders, expenses] = await Promise.all([
+//       prisma.sale.findMany({
+//         where: { 
+//           isOnlineOrder: false,
+//           status: { notIn: ['CANCELLED', 'REJECTED', 'DELIVERY_FAILED'] },
+//           createdAt: { gte: start, lte: end } 
+//         },
+//         include: { items: { include: { product: true } } }
+//       }),
+//       prisma.sale.findMany({
+//         where: { 
+//           isOnlineOrder: true,
+//           status: { notIn: ['CANCELLED', 'REJECTED', 'DELIVERY_FAILED'] },
+//           createdAt: { gte: start, lte: end } 
+//         },
+//         include: { items: { include: { product: true } } }
+//       }),
+//       prisma.expense.findMany({
+//         where: {
+//           OR: [
+//             { date: { lte: end }, endDate: { gte: start } },
+//             { date: { gte: start, lte: end } }
+//           ]
+//         }
+//       })
+//     ]);
+
+//     // Timeline bucket initialization
+//     const timelineMap = {};
+//     let curr = new Date(start);
+
+//     if (groupBy === 'month') {
+//       curr.setDate(1);
+//       curr.setHours(0, 0, 0, 0);
+//       while (curr <= end) {
+//         const key = `${curr.getFullYear()}-${String(curr.getMonth() + 1).padStart(2, '0')}`;
+//         timelineMap[key] = { date: key, label: curr.toLocaleString('default', { month: 'short', year: 'numeric' }), revenue: 0, cogs: 0, expenses: 0, netProfit: 0 };
+//         curr.setMonth(curr.getMonth() + 1);
+//       }
+//     } else {
+//       while (curr <= end) {
+//         const key = curr.toISOString().split('T')[0];
+//         timelineMap[key] = { date: key, label: key, revenue: 0, cogs: 0, expenses: 0, netProfit: 0 };
+//         curr.setDate(curr.getDate() + 1);
+//       }
+//     }
+
+//     let totalRevenue = 0;
+//     let totalCOGS = 0;
+
+//     // Filter sales based on channel view toggle
+//     let activeSales = [];
+//     if (channel === 'POS') activeSales = posSales;
+//     else if (channel === 'ECOMMERCE') activeSales = ecommerceOrders;
+//     else activeSales = [...posSales, ...ecommerceOrders];
+
+//     activeSales.forEach(sale => {
+//       const saleDate = new Date(sale.createdAt);
+//       const dateKey = groupBy === 'month' 
+//         ? `${saleDate.getFullYear()}-${String(saleDate.getMonth() + 1).padStart(2, '0')}`
+//         : saleDate.toISOString().split('T')[0];
+
+//       const rev = parseFloat(sale.totalAmount || 0);
+//       totalRevenue += rev;
+
+//       let saleCogs = 0;
+//       sale.items.forEach(item => {
+//         const buyingPrice = parseFloat(item.product?.buyingPrice || 0);
+//         const lengthMult = item.customLength ? parseFloat(item.customLength) : 1;
+//         saleCogs += buyingPrice * item.quantity * lengthMult;
+//       });
+//       totalCOGS += saleCogs;
+
+//       if (timelineMap[dateKey]) {
+//         timelineMap[dateKey].revenue += rev;
+//         timelineMap[dateKey].cogs += saleCogs;
+//       }
+//     });
+
+//     let totalExpenses = 0;
+
+//     // Prorate expenses with channel matching logic
+//     expenses.forEach(exp => {
+//       // If user selected a specific channel view, filter matching expenses
+//       if (channel !== 'ALL' && exp.channel !== channel && exp.channel !== 'BOTH') {
+//         return; 
+//       }
+
+//       const expStart = new Date(exp.date);
+//       const expEnd = exp.endDate ? new Date(exp.endDate) : new Date(expStart);
+//       const totalSpanDays = Math.max(1, Math.ceil((expEnd - expStart) / (1000 * 60 * 60 * 24)) + 1);
+//       let dailyCost = parseFloat(exp.amount) / totalSpanDays;
+
+//       // If expense is marked as 'BOTH', split 50/50 between POS and E-commerce when viewing individually
+//       if (exp.channel === 'BOTH' && channel !== 'ALL') {
+//         dailyCost = dailyCost / 2;
+//       }
+
+//       let d = new Date(Math.max(expStart, start));
+//       const rangeEndLimit = new Date(Math.min(expEnd, end));
+
+//       while (d <= rangeEndLimit) {
+//         const key = groupBy === 'month'
+//           ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+//           : d.toISOString().split('T')[0];
+
+//         if (timelineMap[key]) {
+//           timelineMap[key].expenses += dailyCost;
+//           totalExpenses += dailyCost;
+//         }
+//         d.setDate(d.getDate() + 1);
+//       }
+//     });
+
+//     const chartData = Object.values(timelineMap).map(item => {
+//       const gross = item.revenue - item.cogs;
+//       item.netProfit = gross - item.expenses;
+//       return item;
+//     });
+
+//     const grossProfit = totalRevenue - totalCOGS;
+//     const netProfit = grossProfit - totalExpenses;
+
+//     res.json({
+//       success: true,
+//       summary: { totalRevenue, totalCOGS, grossProfit, totalExpenses, netProfit },
+//       chartData
+//     });
+//   } catch (error) {
+//     console.error('Error fetching analytics:', error);
+//     res.status(500).json({ error: 'Failed to generate analytics' });
+//   }
+// };
 
 // Advanced Financial Analytics (Revenue, COGS, Amortized Expenses, Net Profit)
 // exports.getFinancialAnalytics = async (req, res) => {
@@ -489,140 +1023,173 @@ const getDateRangeFilter = (filter, customStart, customEnd) => {
 };
 
 // Advanced Financial Analytics with Multi-Month & Multi-Year Aggregation
-exports.getFinancialAnalytics = async (req, res) => {
-  try {
-    const { filter = 'this_month', startDate, endDate } = req.query;
-    const { start, end, groupBy } = getDateRangeFilter(filter, startDate, endDate);
+// Advanced Financial Analytics with POS + E-Commerce Integration & Amortization
+// exports.getFinancialAnalytics = async (req, res) => {
+//   try {
+//     const { filter = 'this_month', startDate, endDate } = req.query;
+//     const { start, end, groupBy } = getDateRangeFilter(filter, startDate, endDate);
 
-    const [sales, expenses] = await Promise.all([
-      prisma.sale.findMany({
-        where: { createdAt: { gte: start, lte: end } },
-        include: { items: { include: { product: true } } }
-      }),
-      prisma.expense.findMany({
-        where: {
-          OR: [
-            { date: { lte: end }, endDate: { gte: start } },
-            { date: { gte: start, lte: end } }
-          ]
-        }
-      })
-    ]);
+//     // Fetch POS sales, E-Commerce sales, and Amortized Expenses in parallel
+//     const [posSales, ecommerceOrders, expenses] = await Promise.all([
+//       // 1. In-Store POS Sales
+//       prisma.sale.findMany({
+//         where: { 
+//           isOnlineOrder: false,
+//           status: { notIn: ['CANCELLED', 'REJECTED', 'DELIVERY_FAILED'] },
+//           createdAt: { gte: start, lte: end } 
+//         },
+//         include: { items: { include: { product: true } } }
+//       }),
+//       // 2. Online E-Commerce Orders (Only count completed/valid orders or delivered ones)
+//       prisma.sale.findMany({
+//         where: { 
+//           isOnlineOrder: true,
+//           status: { notIn: ['CANCELLED', 'REJECTED', 'DELIVERY_FAILED'] },
+//           createdAt: { gte: start, lte: end } 
+//         },
+//         include: { items: { include: { product: true } } }
+//       }),
+//       // 3. Operating Expenses
+//       prisma.expense.findMany({
+//         where: {
+//           OR: [
+//             { date: { lte: end }, endDate: { gte: start } },
+//             { date: { gte: start, lte: end } }
+//           ]
+//         }
+//       })
+//     ]);
 
-    // Build timeline buckets dynamically (Day-wise or Month-wise)
-    // const timelineMap = {};
-    // let curr = new Date(start);
+//     // Combine all valid sales transactions for unified reporting
+//     const allSales = [...posSales, ...ecommerceOrders];
 
-    // if (groupBy === 'month') {
-    //   // Normalize to the first day of each month in the range
-    //   curr.setDate(1);
-    //   curr.setHours(0, 0, 0, 0);
-    //   while (curr <= end) {
-    //     const key = `${curr.getFullYear()}-${String(curr.getMonth() + 1).padStart(2, '0')}`;
-    //     timelineMap[key] = { date: key, label: curr.toLocaleString('default', { month: 'short', year: 'numeric' }), revenue: 0, cogs: 0, expenses: 0, netProfit: 0 };
-    //     curr.setMonth(curr.getMonth() + 1);
-    //   }
-    // } else {
-    //   while (curr <= end) {
-    //     const key = curr.toISOString().split('T')[0];
-    //     timelineMap[key] = { date: key, label: key, revenue: 0, cogs: 0, expenses: 0, netProfit: 0 };
-    //     curr.setDate(curr.getDate() + 1);
-    //   }
-    // }
-    // Build timeline buckets dynamically (Day-wise or Month-wise)
-    const timelineMap = {};
-    let curr = new Date(start);
+//     // Build timeline buckets dynamically (Day-wise or Month-wise)
+//     const timelineMap = {};
+//     let curr = new Date(start);
 
-    if (groupBy === 'month') {
-      curr.setDate(1);
-      curr.setHours(0, 0, 0, 0);
-      while (curr <= end) {
-        const key = `${curr.getFullYear()}-${String(curr.getMonth() + 1).padStart(2, '0')}`;
-        timelineMap[key] = { date: key, label: curr.toLocaleString('default', { month: 'short', year: 'numeric' }), revenue: 0, cogs: 0, expenses: 0, netProfit: 0 };
-        curr.setMonth(curr.getMonth() + 1);
-      }
-    } else {
-      while (curr <= end) {
-        const key = curr.toISOString().split('T')[0];
-        // ADDED 'label: key' HERE SO DAY-WISE CHARTS RENDER PROPERLY:
-        timelineMap[key] = { date: key, label: key, revenue: 0, cogs: 0, expenses: 0, netProfit: 0 };
-        curr.setDate(curr.getDate() + 1);
-      }
-    }
+//     if (groupBy === 'month') {
+//       curr.setDate(1);
+//       curr.setHours(0, 0, 0, 0);
+//       while (curr <= end) {
+//         const key = `${curr.getFullYear()}-${String(curr.getMonth() + 1).padStart(2, '0')}`;
+//         timelineMap[key] = { 
+//           date: key, 
+//           label: curr.toLocaleString('default', { month: 'short', year: 'numeric' }), 
+//           revenue: 0, 
+//           posRevenue: 0,
+//           ecommerceRevenue: 0,
+//           cogs: 0, 
+//           expenses: 0, 
+//           netProfit: 0 
+//         };
+//         curr.setMonth(curr.getMonth() + 1);
+//       }
+//     } else {
+//       while (curr <= end) {
+//         const key = curr.toISOString().split('T')[0];
+//         timelineMap[key] = { 
+//           date: key, 
+//           label: key, 
+//           revenue: 0, 
+//           posRevenue: 0,
+//           ecommerceRevenue: 0,
+//           cogs: 0, 
+//           expenses: 0, 
+//           netProfit: 0 
+//         };
+//         curr.setDate(curr.getDate() + 1);
+//       }
+//     }
 
-    let totalRevenue = 0;
-    let totalCOGS = 0;
+//     let totalRevenue = 0;
+//     let totalPosRevenue = 0;
+//     let totalEcommerceRevenue = 0;
+//     let totalCOGS = 0;
 
-    // Aggregate Sales Revenue & COGS
-    sales.forEach(sale => {
-      const saleDate = new Date(sale.createdAt);
-      const dateKey = groupBy === 'month' 
-        ? `${saleDate.getFullYear()}-${String(saleDate.getMonth() + 1).padStart(2, '0')}`
-        : saleDate.toISOString().split('T')[0];
+//     // Aggregate Sales Revenue & COGS (Separating POS vs E-Commerce for granular tracking)
+//     allSales.forEach(sale => {
+//       const saleDate = new Date(sale.createdAt);
+//       const dateKey = groupBy === 'month' 
+//         ? `${saleDate.getFullYear()}-${String(saleDate.getMonth() + 1).padStart(2, '0')}`
+//         : saleDate.toISOString().split('T')[0];
 
-      const rev = parseFloat(sale.totalAmount || 0);
-      totalRevenue += rev;
+//       const rev = parseFloat(sale.totalAmount || 0);
+//       totalRevenue += rev;
 
-      let saleCogs = 0;
-      sale.items.forEach(item => {
-        const buyingPrice = parseFloat(item.product?.buyingPrice || 0);
-        saleCogs += buyingPrice * item.quantity;
-      });
-      totalCOGS += saleCogs;
+//       if (sale.isOnlineOrder) {
+//         totalEcommerceRevenue += rev;
+//       } else {
+//         totalPosRevenue += rev;
+//       }
 
-      if (timelineMap[dateKey]) {
-        timelineMap[dateKey].revenue += rev;
-        timelineMap[dateKey].cogs += saleCogs;
-      }
-    });
+//       let saleCogs = 0;
+//       sale.items.forEach(item => {
+//         const buyingPrice = parseFloat(item.product?.buyingPrice || 0);
+//         const lengthMult = item.customLength ? parseFloat(item.customLength) : 1;
+//         saleCogs += buyingPrice * item.quantity * lengthMult;
+//       });
+//       totalCOGS += saleCogs;
 
-    let totalExpenses = 0;
+//       if (timelineMap[dateKey]) {
+//         timelineMap[dateKey].revenue += rev;
+//         if (sale.isOnlineOrder) {
+//           timelineMap[dateKey].ecommerceRevenue += rev;
+//         } else {
+//           timelineMap[dateKey].posRevenue += rev;
+//         }
+//         timelineMap[dateKey].cogs += saleCogs;
+//       }
+//     });
 
-    // Prorate expenses across buckets (daily or monthly distribution)
-    expenses.forEach(exp => {
-      const expStart = new Date(exp.date);
-      const expEnd = exp.endDate ? new Date(exp.endDate) : new Date(expStart);
-      const totalSpanDays = Math.max(1, Math.ceil((expEnd - expStart) / (1000 * 60 * 60 * 24)) + 1);
-      const dailyCost = parseFloat(exp.amount) / totalSpanDays;
+//     let totalExpenses = 0;
 
-      let d = new Date(Math.max(expStart, start));
-      const rangeEndLimit = new Date(Math.min(expEnd, end));
+//     // Prorate amortized expenses across buckets
+//     expenses.forEach(exp => {
+//       const expStart = new Date(exp.date);
+//       const expEnd = exp.endDate ? new Date(exp.endDate) : new Date(expStart);
+//       const totalSpanDays = Math.max(1, Math.ceil((expEnd - expStart) / (1000 * 60 * 60 * 24)) + 1);
+//       const dailyCost = parseFloat(exp.amount) / totalSpanDays;
 
-      while (d <= rangeEndLimit) {
-        const key = groupBy === 'month'
-          ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
-          : d.toISOString().split('T')[0];
+//       let d = new Date(Math.max(expStart, start));
+//       const rangeEndLimit = new Date(Math.min(expEnd, end));
 
-        if (timelineMap[key]) {
-          timelineMap[key].expenses += dailyCost;
-          totalExpenses += dailyCost;
-        }
-        d.setDate(d.getDate() + 1);
-      }
-    });
+//       while (d <= rangeEndLimit) {
+//         const key = groupBy === 'month'
+//           ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+//           : d.toISOString().split('T')[0];
 
-    const chartData = Object.values(timelineMap).map(item => {
-      const gross = item.revenue - item.cogs;
-      item.netProfit = gross - item.expenses;
-      return item;
-    });
+//         if (timelineMap[key]) {
+//           timelineMap[key].expenses += dailyCost;
+//           totalExpenses += dailyCost;
+//         }
+//         d.setDate(d.getDate() + 1);
+//       }
+//     });
 
-    const grossProfit = totalRevenue - totalCOGS;
-    const netProfit = grossProfit - totalExpenses;
+//     const chartData = Object.values(timelineMap).map(item => {
+//       const gross = item.revenue - item.cogs;
+//       item.netProfit = gross - item.expenses;
+//       return item;
+//     });
 
-    res.json({
-      success: true,
-      summary: {
-        totalRevenue,
-        totalCOGS,
-        grossProfit,
-        totalExpenses,
-        netProfit
-      },
-      chartData
-    });
-  } catch (error) {
-    console.error('Error fetching analytics:', error);
-    res.status(500).json({ error: 'Failed to generate analytics' });
-  }
-};
+//     const grossProfit = totalRevenue - totalCOGS;
+//     const netProfit = grossProfit - totalExpenses;
+
+//     res.json({
+//       success: true,
+//       summary: {
+//         totalRevenue,
+//         totalPosRevenue,
+//         totalEcommerceRevenue,
+//         totalCOGS,
+//         grossProfit,
+//         totalExpenses,
+//         netProfit
+//       },
+//       chartData
+//     });
+//   } catch (error) {
+//     console.error('Error fetching analytics:', error);
+//     res.status(500).json({ error: 'Failed to generate analytics' });
+//   }
+// };

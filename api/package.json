@@ -1,10 +1,11 @@
 {
   "name": "api",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
+    "postinstall": "prisma generate",
     "seed": "node seeds.js",
     "prisma:generate": "prisma generate",
     "prisma:push": "prisma db push",
@@ -19,7 +20,6 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@prisma/adapter-pg": "^7.10.1",
     "@prisma/client": "^5.19.0",
     "axios": "^1.21.0",
     "bcryptjs": "^3.0.3",
@@ -33,11 +33,11 @@
     "multer": "^2.5.0",
     "pdfkit": "^0.20.2",
     "pg": "^8.23.1",
+    "prisma": "^5.19.0",
     "sharp": "^0.35.5",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
-    "nodemon": "^3.1.14",
-    "prisma": "^5.19.0"
+    "nodemon": "^3.1.14"
   }
 }

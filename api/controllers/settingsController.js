@@ -54,7 +54,7 @@ exports.createUser = async (req, res) => {
         email: email || null,
         passwordHash,
         role: role || 'SALESMAN',
-        permissions: permissions || { canViewProfit: false, canEditStock: false },
+        permissions: permissions || {canManageEcommerce: false, canViewProfit: false, canEditStock: false },
         isActive: isActive ?? true
       },
       select: {
@@ -176,6 +176,7 @@ exports.updateSettings = async (req, res) => {
     const {
       shopName,
       requireDueOtpVerify,
+      requireOrderOtpVerify, 
       smsGatewayApiKey,
       smsSenderId,
       bkashMerchantId,
@@ -186,7 +187,8 @@ exports.updateSettings = async (req, res) => {
       where: { id: 'global_config' },
       update: {
         shopName,
-        requireDueOtpVerify,
+        requireDueOtpVerify: requireDueOtpVerify === 'true' || requireDueOtpVerify === true,
+        requireOrderOtpVerify: requireOrderOtpVerify === 'true' || requireOrderOtpVerify === true,
         smsGatewayApiKey,
         smsSenderId,
         bkashMerchantId,
@@ -194,8 +196,9 @@ exports.updateSettings = async (req, res) => {
       },
       create: {
         id: 'global_config',
-        shopName: shopName || 'Makkah Hardware & Tools',
+        shopName: shopName || 'Hardware Shop',
         requireDueOtpVerify: requireDueOtpVerify ?? true,
+        requireOrderOtpVerify: requireOrderOtpVerify ?? true,
         smsGatewayApiKey,
         smsSenderId,
         bkashMerchantId,

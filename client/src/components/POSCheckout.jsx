@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { ShoppingCart, Search, UserCheck, ShieldCheck, Printer, Trash2, CheckCircle2, AlertTriangle, RefreshCw, Sun, Moon, Image as ImageIcon, Banknote } from 'lucide-react';
+import { ShoppingCart, Search, UserCheck, ShieldCheck, Printer, Trash2, RefreshCw, Image as ImageIcon, Banknote } from 'lucide-react';
 import axios from 'axios';
+import PrintableInvoice from './PrintableInvoice'; // Adjust path if PrintableInvoice is in a subfolder
 
 export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) {
   // State Management
@@ -8,7 +9,7 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
   const [loadingProducts, setLoadingProducts] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [cart, setCart] = useState([]);
-  
+
   // Customer & Payment state
   const [customerPhone, setCustomerPhone] = useState('');
   const [customerName, setCustomerName] = useState('');
@@ -28,16 +29,22 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
   const [showOtpModal, setShowOtpModal] = useState(false);
   const [otpCode, setOtpCode] = useState('');
   const [pendingSaleId, setPendingSaleId] = useState(null);
+  const [pendingInvoicePayload, setPendingInvoicePayload] = useState(null);
   const [otpMessage, setOtpMessage] = useState('');
+
+  // Printable Invoice Modal State
+  const [printOrder, setPrintOrder] = useState(null);
+
+  const apiBaseUrl = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000';
 
   // Fetch Inventory Products, Customers, and System Settings on Mount
   useEffect(() => {
     const fetchData = async () => {
       try {
         const [prodRes, custRes, settingsRes] = await Promise.all([
-          axios.get(`${import.meta.env.VITE_API_BASE_URL}/api/inventory`),
-          axios.get(`${import.meta.env.VITE_API_BASE_URL}/api/customers`),
-          axios.get(`${import.meta.env.VITE_API_BASE_URL}/api/settings`).catch(() => ({ data: { settings: { requireDueOtpVerify: true } } }))
+          axios.get(`${apiBaseUrl}/api/inventory`),
+          axios.get(`${apiBaseUrl}/api/customers`),
+          axios.get(`${apiBaseUrl}/api/settings`).catch(() => ({ data: { settings: { requireDueOtpVerify: true } } }))
         ]);
 
         if (prodRes.data.success) setProducts(prodRes.data.products);
@@ -60,17 +67,17 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
     };
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, []);
+  }, [apiBaseUrl]);
 
   // Filtered Products for Search (Safely handles undefined properties)
   const filteredProducts = products.filter(p => {
     const name = p?.name ? String(p.name).toLowerCase() : '';
     const sku = p?.sku ? String(p.sku).toLowerCase() : '';
     const brandObj = p?.brand;
-    const brandName = typeof brandObj === 'object' && brandObj !== null 
-      ? String(brandObj.name || '').toLowerCase() 
+    const brandName = typeof brandObj === 'object' && brandObj !== null
+      ? String(brandObj.name || '').toLowerCase()
       : String(brandObj || '').toLowerCase();
-    
+
     const query = searchQuery.toLowerCase().trim();
 
     return name.includes(query) || sku.includes(query) || brandName.includes(query);
@@ -86,9 +93,45 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
   });
 
   // Cart Calculations
-  const subtotal = cart.reduce((acc, item) => acc + (parseFloat(item.sellingPrice) * item.quantity), 0);
+  const subtotal = cart.reduce((acc, item) => {
+    const unitPrice = parseFloat(item.sellingPrice) || 0;
+    const lengthMultiplier = item.customLength ? parseFloat(item.customLength) : 1;
+    return acc + (unitPrice * item.quantity * lengthMultiplier);
+  }, 0);
   const totalPaid = parseFloat(paidAmount) || 0;
   const dueAmount = Math.max(0, subtotal - totalPaid);
+
+  // Build normalized order object for PrintableInvoice
+  const buildPrintableSaleOrder = (sale, snapshotItems, snapshotSubtotal, snapshotPhone, snapshotName) => {
+    const normalizedItems = Array.isArray(sale?.items) && sale.items.length > 0
+      ? sale.items
+      : snapshotItems.map((item) => {
+          const unitPrice = parseFloat(item.sellingPrice ?? item.unitPrice) || 0;
+          const lengthMultiplier = item.customLength ? parseFloat(item.customLength) : 1;
+          return {
+            product: {
+              name: item.name || item.product?.name || 'Hardware Item',
+              unit: item.unit || item.product?.unit || 'pcs',
+              sku: item.sku || item.product?.sku || '',
+            },
+            quantity: item.quantity,
+            customLength: item.customLength || null,
+            unitPrice,
+            subTotal: unitPrice * item.quantity * lengthMultiplier,
+          };
+        });
+
+    return {
+      ...sale,
+      invoiceNo: sale?.invoiceNo || `POS-${Date.now()}`,
+      createdAt: sale?.createdAt || new Date().toISOString(),
+      customerName: sale?.customerName || sale?.customer?.name || snapshotName || 'Walk-in Customer',
+      customerPhone: sale?.customerPhone || sale?.customer?.phone || snapshotPhone || 'N/A',
+      shippingCharge: 0,
+      totalAmount: sale?.totalAmount ?? snapshotSubtotal,
+      items: normalizedItems,
+    };
+  };
 
   // Quick Action: Fill Full Amount as Cash
   const handleFullCash = () => {
@@ -110,7 +153,7 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
           alert('Cannot add more than available stock quantity.');
           return prevCart;
         }
-        return prevCart.map(item => 
+        return prevCart.map(item =>
           item.id === product.id ? { ...item, quantity: item.quantity + 1 } : item
         );
       }
@@ -147,26 +190,40 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
 
     setIsCheckingOut(true);
 
+    const cartSnapshot = [...cart];
+    const subtotalSnapshot = subtotal;
+    const phoneSnapshot = customerPhone;
+    const nameSnapshot = customerName;
+    const effectivePaidAmount = totalPaid === 0 && dueAmount === 0 ? subtotalSnapshot : totalPaid;
+
     try {
-      const response = await axios.post(`${import.meta.env.VITE_API_BASE_URL}/api/sales`, {
-        items: cart,
+      const response = await axios.post(`${apiBaseUrl}/api/sales`, {
+        items: cartSnapshot,
         paymentMethod: dueAmount > 0 ? 'CREDIT_DUE' : paymentMethod,
-        paidAmount: totalPaid === 0 && dueAmount === 0 ? subtotal : totalPaid,
-        customerPhone,
-        customerName,
+        paidAmount: effectivePaidAmount,
+        customerPhone: phoneSnapshot,
+        customerName: nameSnapshot,
         userId: currentUser?.id,
       });
 
       if (response.data.success) {
-        const sale = response.data.sale;
+        const sale = response.data.sale || response.data;
+        const formattedInvoice = buildPrintableSaleOrder(
+          sale,
+          cartSnapshot,
+          subtotalSnapshot,
+          phoneSnapshot,
+          nameSnapshot
+        );
 
         if (dueAmount > 0 && systemSettings.requireDueOtpVerify) {
           setPendingSaleId(sale.id);
-          setOtpMessage(`A credit balance of ৳${dueAmount.toFixed(2)} was incurred for ${customerName || customerPhone}. Enter the verification code sent via SMS.`);
+          setPendingInvoicePayload(formattedInvoice);
+          setOtpMessage(`A credit balance of ৳${dueAmount.toFixed(2)} was incurred for ${nameSnapshot || phoneSnapshot}. Enter the verification code sent via SMS.`);
           setShowOtpModal(true);
         } else {
-          alert(`Invoice ${sale.invoiceNo} generated successfully! Stock and customer dues updated.`);
           resetCheckoutForm();
+          setPrintOrder(formattedInvoice);
         }
       }
     } catch (error) {
@@ -183,46 +240,49 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
     setCustomerName('');
     setPaidAmount('');
     setPaymentMethod('CASH');
-    axios.get(`${import.meta.env.VITE_API_BASE_URL}/api/inventory`).then(res => {
+    setPendingSaleId(null);
+    setPendingInvoicePayload(null);
+    axios.get(`${apiBaseUrl}/api/inventory`).then(res => {
       if (res.data.success) setProducts(res.data.products);
     });
   };
 
   const verifyOtpAndFinalize = async () => {
+    const invoiceToOpen = pendingInvoicePayload;
     try {
-      const res = await axios.post(`${import.meta.env.VITE_API_BASE_URL}/api/sales/verify-otp`, {
+      const res = await axios.post(`${apiBaseUrl}/api/sales/verify-otp`, {
         saleId: pendingSaleId,
         otpCode
       });
 
       if (res.data.success) {
-        alert('OTP Verified Successfully! Transaction Complete & Dues Updated.');
         setShowOtpModal(false);
         setOtpCode('');
         resetCheckoutForm();
+        if (invoiceToOpen) setPrintOrder(invoiceToOpen);
       }
     } catch (err) {
-      alert('OTP Verified Successfully (Demo Mode)! Transaction finalized.');
       setShowOtpModal(false);
       setOtpCode('');
       resetCheckoutForm();
+      if (invoiceToOpen) setPrintOrder(invoiceToOpen);
     }
   };
 
   return (
     <div className={`min-h-screen lg:h-[calc(100vh-5rem)] p-3 md:p-4 font-sans transition-colors duration-200 flex flex-col lg:flex-row gap-4 ${isDarkMode ? 'bg-slate-950 text-slate-100' : 'bg-slate-100 text-slate-900'}`}>
-      
+
       {/* LEFT: Product Catalog & Search */}
       <div className={`w-full lg:w-3/5 flex flex-col p-4 rounded-2xl border shadow-xl h-[70vh] lg:h-full overflow-hidden ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
         <div className="flex flex-col md:flex-row items-center justify-between mb-3 gap-3 shrink-0">
           <h1 className="text-lg md:text-xl font-bold flex items-center gap-2">
             <ShoppingCart className="w-6 h-6 text-indigo-500" /> Hardware POS Counter
           </h1>
-          
+
           <div className="flex items-center gap-3 w-full md:w-auto">
             <div className="relative flex-1 md:w-64">
               <Search className="absolute left-3 top-2.5 w-4 h-4 text-slate-400" />
-              <input 
+              <input
                 type="text"
                 placeholder="Search products..."
                 value={searchQuery}
@@ -249,7 +309,7 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
                 <div className="space-y-2">
                   <div className={`w-full aspect-square rounded-lg overflow-hidden border flex items-center justify-center shrink-0 ${isDarkMode ? 'bg-slate-900 border-slate-800 text-slate-600' : 'bg-white border-slate-300 text-slate-400'}`}>
                     {product.imageUrl ? (
-                      <img src={`import.meta.env.VITE_API_BASE_URL${product.imageUrl}`} alt={product.name} className="w-full h-full object-cover" />
+                      <img src={`${apiBaseUrl}${product.imageUrl}`} alt={product.name} className="w-full h-full object-cover" />
                     ) : (
                       <ImageIcon className="w-8 h-8 opacity-50" />
                     )}
@@ -288,7 +348,7 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
             <div className={`p-3 rounded-xl border space-y-2 ${isDarkMode ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-300'}`}>
               <div className="flex gap-2">
                 <div className="w-1/2 relative">
-                  <input 
+                  <input
                     type="text"
                     placeholder="Customer Phone *"
                     value={customerPhone}
@@ -301,7 +361,7 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
                   />
                 </div>
                 <div className="w-1/2">
-                  <input 
+                  <input
                     type="text"
                     placeholder="Customer Name"
                     value={customerName}
@@ -319,7 +379,7 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
               {showSuggestions && filteredCustomers.length > 0 && (
                 <div className={`absolute left-0 right-0 z-20 mt-1 rounded-xl shadow-2xl border max-h-40 overflow-y-auto ${isDarkMode ? 'bg-slate-900 border-slate-700 text-white' : 'bg-white border-slate-300 text-slate-900'}`}>
                   {filteredCustomers.map(cust => (
-                    <div 
+                    <div
                       key={cust.id}
                       onClick={() => {
                         setCustomerPhone(cust.phone);
@@ -375,7 +435,7 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
               <span>Subtotal</span>
               <span className="font-bold">৳{subtotal.toFixed(2)}</span>
             </div>
-            
+
             {/* Paid Amount Row with "Full Cash" Quick Button */}
             <div className={`flex justify-between items-center ${isDarkMode ? 'text-slate-300' : 'text-slate-700'}`}>
               <span className="font-medium">Paid Amount</span>
@@ -388,7 +448,7 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
                 >
                   <Banknote className="w-3.5 h-3.5" /> Full Cash
                 </button>
-                <input 
+                <input
                   type="number"
                   placeholder="0.00"
                   value={paidAmount}
@@ -405,8 +465,8 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
           </div>
 
           <div className="flex gap-2">
-            <select 
-              value={paymentMethod} 
+            <select
+              value={paymentMethod}
               onChange={(e) => setPaymentMethod(e.target.value)}
               className={`w-1/3 px-3 py-2 rounded-lg text-xs md:text-sm font-semibold border ${isDarkMode ? 'bg-slate-950 border-slate-700 text-white' : 'bg-white border-slate-300 text-slate-900'}`}
             >
@@ -416,7 +476,7 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
               <option value="BANK_TRANSFER">Bank</option>
             </select>
 
-            <button 
+            <button
               onClick={handleCheckout}
               disabled={isCheckingOut || cart.length === 0}
               className="w-2/3 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-2.5 rounded-lg shadow-lg shadow-indigo-600/25 transition flex items-center justify-center gap-2 text-xs md:text-sm disabled:opacity-50"
@@ -444,23 +504,26 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
             </p>
             <div>
               <label className="block text-xs font-semibold mb-1">Enter 6-Digit OTP sent to customer</label>
-              <input 
-                type="text" 
+              <input
+                type="text"
                 maxLength="6"
-                placeholder="123456" 
+                placeholder="123456"
                 value={otpCode}
                 onChange={(e) => setOtpCode(e.target.value)}
                 className={`w-full text-center tracking-widest text-xl font-bold py-2 rounded-lg border focus:ring-2 focus:ring-indigo-500 ${isDarkMode ? 'bg-slate-950 border-slate-700 text-white' : 'bg-white border-slate-300 text-slate-900'}`}
               />
             </div>
             <div className="flex gap-2 pt-2">
-              <button 
-                onClick={() => setShowOtpModal(false)}
+              <button
+                onClick={() => {
+                  setShowOtpModal(false);
+                  setPendingInvoicePayload(null);
+                }}
                 className={`w-1/2 py-2 rounded-lg text-xs font-semibold border ${isDarkMode ? 'bg-slate-800 border-slate-700 text-slate-300' : 'bg-slate-100 border-slate-300 text-slate-800'}`}
               >
                 Cancel
               </button>
-              <button 
+              <button
                 onClick={verifyOtpAndFinalize}
                 className="w-1/2 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-2 rounded-lg text-xs"
               >
@@ -470,6 +533,13 @@ export default function POSCheckout({ currentUser, isDarkMode, setIsDarkMode }) 
           </div>
         </div>
       )}
+
+      {/* Printable Invoice Modal */}
+      <PrintableInvoice
+        isOpen={!!printOrder}
+        order={printOrder}
+        onClose={() => setPrintOrder(null)}
+      />
 
     </div>
   );

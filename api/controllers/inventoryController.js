@@ -1,4 +1,3 @@
-// api/controllers/inventoryController.js
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const xlsx = require('xlsx');
@@ -8,7 +7,7 @@ const fs = require('fs');
 
 // Helper to process & auto-crop image to 1:1 ratio (600x600 px)
 const processProductImage = async (fileBuffer) => {
-  const uploadDir = path.join(__dirname, '../uploads');
+  const uploadDir = path.join(__dirname, '../public/uploads');
   if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true });
   }
@@ -28,6 +27,22 @@ const processProductImage = async (fileBuffer) => {
   return `/uploads/${filename}`;
 };
 
+// Helper to sanitize array of image URLs
+const parseImageUrls = (imageUrls) => {
+  if (!imageUrls) return [];
+  if (Array.isArray(imageUrls)) return imageUrls;
+  if (typeof imageUrls === 'string') {
+    try {
+      const parsed = JSON.parse(imageUrls);
+      if (Array.isArray(parsed)) return parsed;
+    } catch (e) {
+      // If not JSON, split comma-separated string
+      return imageUrls.split(',').map((url) => url.trim()).filter(Boolean);
+    }
+  }
+  return [];
+};
+
 // 1. Get All Products
 exports.getAllProducts = async (req, res) => {
   try {
@@ -42,34 +57,52 @@ exports.getAllProducts = async (req, res) => {
   }
 };
 
-// 2. Add Single Product with Image
-// F:\hardWarePOS\api\controllers\inventoryController.js
-
+// 2. Add Single Product
 exports.addProduct = async (req, res) => {
   try {
-    const { name, sku, sellingPrice, buyingPrice, stockQuantity, brandId, categoryId, size, color } = req.body;
+    const {
+      name,
+      sku,
+      sellingPrice,
+      buyingPrice,
+      stockQuantity,
+      reorderLevel,
+      brandId,
+      categoryId,
+      size,
+      color,
+      unit,
+      description,
+      isPublished,
+      allowCustomLength,
+      imageUrl: bodyImageUrl,
+      imageUrls: bodyImageUrls,
+    } = req.body;
 
     // 1. Ensure SKU is provided or generate a unique random fallback SKU
-    const finalSku = sku && sku.trim() !== '' 
-      ? sku.trim() 
-      : `SKU-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
+    const finalSku =
+      sku && sku.trim() !== ''
+        ? sku.trim()
+        : `SKU-${Date.now()}-${Math.floor(1000 + Math.random() * 9000)}`;
 
     // 2. Check explicitly if SKU exists before creating
     const existingProduct = await prisma.product.findUnique({
-      where: { sku: finalSku }
+      where: { sku: finalSku },
     });
 
     if (existingProduct) {
-      return res.status(400).json({ 
-        success: false, 
-        error: `A product with SKU "${finalSku}" already exists. Please use a unique SKU.` 
+      return res.status(400).json({
+        success: false,
+        error: `A product with SKU "${finalSku}" already exists. Please use a unique SKU.`,
       });
     }
 
-    let imageUrl = null;
+    let imageUrl = bodyImageUrl || null;
     if (req.file) {
       imageUrl = await processProductImage(req.file.buffer);
     }
+
+    const formattedImageUrls = parseImageUrls(bodyImageUrls);
 
     // 3. Create Product in DB
     const newProduct = await prisma.product.create({
@@ -78,17 +111,22 @@ exports.addProduct = async (req, res) => {
         sku: finalSku,
         sellingPrice: parseFloat(sellingPrice),
         buyingPrice: parseFloat(buyingPrice || 0),
-        stockQuantity: parseInt(stockQuantity, 10),
+        stockQuantity: parseInt(stockQuantity || 0, 10),
+        reorderLevel: parseInt(reorderLevel || 5, 10),
+        unit: unit || 'pieces',
         size: size || null,
         color: color || null,
+        description: description || null,
+        isPublished: isPublished === 'true' || isPublished === true,
+        allowCustomLength: allowCustomLength === 'true' || allowCustomLength === true,
         imageUrl,
-        ...(brandId && { brand: { connect: { id: parseInt(brandId, 10) } } }),
-        ...(categoryId && { category: { connect: { id: parseInt(categoryId, 10) } } })
-      }
+        imageUrls: formattedImageUrls,
+        ...(brandId && { brand: { connect: { id: brandId } } }),
+        ...(categoryId && { category: { connect: { id: categoryId } } }),
+      },
     });
 
     return res.status(201).json({ success: true, product: newProduct });
-
   } catch (error) {
     console.error('Error creating product:', error);
 
@@ -96,43 +134,73 @@ exports.addProduct = async (req, res) => {
     if (error.code === 'P2002' && error.meta?.target?.includes('sku')) {
       return res.status(400).json({
         success: false,
-        error: 'Product SKU must be unique. Duplicate SKU detected.'
+        error: 'Product SKU must be unique. Duplicate SKU detected.',
       });
     }
 
-    return res.status(500).json({ success: false, error: 'Internal server error while creating product.' });
+    return res
+      .status(500)
+      .json({ success: false, error: 'Internal server error while creating product.' });
   }
 };
 
-// 3. Update Product with Image
+// 3. Update Product
 exports.updateProduct = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, sku, size, color, unit, buyingPrice, sellingPrice, stockQuantity, reorderLevel } = req.body;
+    const {
+      name,
+      sku,
+      size,
+      color,
+      unit,
+      buyingPrice,
+      sellingPrice,
+      stockQuantity,
+      reorderLevel,
+      description,
+      isPublished,
+      allowCustomLength,
+      imageUrl: bodyImageUrl,
+      imageUrls: bodyImageUrls,
+      brandId,
+      categoryId,
+    } = req.body;
 
     const existingProduct = await prisma.product.findUnique({ where: { id } });
     if (!existingProduct) {
       return res.status(404).json({ error: 'Product not found' });
     }
 
-    let imageUrl = existingProduct.imageUrl;
+    let imageUrl = bodyImageUrl !== undefined ? bodyImageUrl : existingProduct.imageUrl;
     if (req.file) {
       imageUrl = await processProductImage(req.file.buffer);
     }
+
+    const formattedImageUrls =
+      bodyImageUrls !== undefined
+        ? parseImageUrls(bodyImageUrls)
+        : existingProduct.imageUrls;
 
     const updatedProduct = await prisma.product.update({
       where: { id },
       data: {
         name,
         sku,
-        size,
-        color,
-        unit,
+        size: size || null,
+        color: color || null,
+        unit: unit || 'pieces',
         buyingPrice: parseFloat(buyingPrice),
         sellingPrice: parseFloat(sellingPrice),
         stockQuantity: parseInt(stockQuantity, 10),
         reorderLevel: parseInt(reorderLevel, 10),
+        description: description || null,
+        isPublished: isPublished === 'true' || isPublished === true,
+        allowCustomLength: allowCustomLength === 'true' || allowCustomLength === true,
         imageUrl,
+        imageUrls: formattedImageUrls,
+        ...(brandId ? { brand: { connect: { id: brandId } } } : { brand: { disconnect: true } }),
+        ...(categoryId ? { category: { connect: { id: categoryId } } } : { category: { disconnect: true } }),
       },
     });
 
@@ -143,7 +211,7 @@ exports.updateProduct = async (req, res) => {
   }
 };
 
-// 3. Import Products from Excel Sheet
+// 4. Import Products from Excel Sheet
 exports.importExcel = async (req, res) => {
   try {
     if (!req.file) {
@@ -156,22 +224,24 @@ exports.importExcel = async (req, res) => {
 
     // Convert sheet to array of arrays to find the real header row dynamically
     const rows = xlsx.utils.sheet_to_json(sheet, { header: 1 });
-    
+
     let headerRowIndex = -1;
     let headers = [];
 
     // Search for the row that contains column headers like 'SKU' or 'Product Name'
     for (let i = 0; i < rows.length; i++) {
-      const rowStr = rows[i].map(cell => String(cell || '').trim().toLowerCase());
+      const rowStr = rows[i].map((cell) => String(cell || '').trim().toLowerCase());
       if (rowStr.includes('sku') || rowStr.includes('product name') || rowStr.includes('name')) {
         headerRowIndex = i;
-        headers = rows[i].map(h => String(h || '').trim());
+        headers = rows[i].map((h) => String(h || '').trim());
         break;
       }
     }
 
     if (headerRowIndex === -1) {
-      return res.status(400).json({ error: 'Could not find valid column headers (SKU, Product Name) in the Excel sheet.' });
+      return res.status(400).json({
+        error: 'Could not find valid column headers (SKU, Product Name) in the Excel sheet.',
+      });
     }
 
     // Map the remaining rows using the detected headers
@@ -190,24 +260,32 @@ exports.importExcel = async (req, res) => {
       const name = rowObj['product name'] || rowObj['name'] || rowObj['item name'];
       if (!name) continue;
 
-      const sku = rowObj['sku'] || rowObj['code'] || `HW-${Math.floor(100000 + Math.random() * 900000)}`;
+      const sku =
+        rowObj['sku'] || rowObj['code'] || `HW-${Math.floor(100000 + Math.random() * 900000)}`;
       const size = rowObj['size'] || 'N/A';
       const color = rowObj['color'] || 'N/A';
       const unit = rowObj['unit'] || 'pieces';
-      const buyingPrice = parseFloat(rowObj['buying price (৳)'] || rowObj['buying price'] || rowObj['cost'] || 0);
-      const sellingPrice = parseFloat(rowObj['selling price (৳)'] || rowObj['selling price'] || rowObj['price'] || 0);
-      const stockQuantity = parseInt(rowObj['stock quantity'] || rowObj['stock'] || rowObj['quantity'] || 0, 10);
+      const buyingPrice = parseFloat(
+        rowObj['buying price (৳)'] || rowObj['buying price'] || rowObj['cost'] || 0
+      );
+      const sellingPrice = parseFloat(
+        rowObj['selling price (৳)'] || rowObj['selling price'] || rowObj['price'] || 0
+      );
+      const stockQuantity = parseInt(
+        rowObj['stock quantity'] || rowObj['stock'] || rowObj['quantity'] || 0,
+        10
+      );
       const reorderLevel = parseInt(rowObj['reorder level'] || rowObj['reorder'] || 5, 10);
 
       await prisma.product.upsert({
         where: { sku: String(sku) },
-        update: { 
-          name: String(name), 
-          size: String(size), 
-          color: String(color), 
-          buyingPrice, 
-          sellingPrice, 
-          stockQuantity 
+        update: {
+          name: String(name),
+          size: String(size),
+          color: String(color),
+          buyingPrice,
+          sellingPrice,
+          stockQuantity,
         },
         create: {
           sku: String(sku),
@@ -235,7 +313,7 @@ exports.importExcel = async (req, res) => {
   }
 };
 
-// Delete a product
+// 5. Delete a product
 exports.deleteProduct = async (req, res) => {
   try {
     const { id } = req.params;
